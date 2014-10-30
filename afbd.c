@@ -7,6 +7,8 @@
  *	I/O ports at ac00 [size=8] <---
  *
  *	COMPILE:	make -C /lib/modules/`uname -r`/build M=`pwd` modules
+ *        (In order for the compiler to compile this code, you'll need to download 
+ *        the Linux headers package from your repository)
  *	USE:		insmod afbd.ko
  *	REMOVE:		rmmod afbd.ko
  *
@@ -38,7 +40,6 @@
  *  2010 Pat Patterson <pat at superpat dot com>) and on the WD POC developed by Ariel Berkman <ariel@recover.co.il> from Recover Information Technologies LTD.
  *
  * (C) Copyright 2014 Daniel O'Grady Rueda <daniel.ogrady@hard2bit.com> - Hard2bit Data Forensics
- * (C) 2013 Ariel Berkman <ariel@recover.co.il>
  * (C) 2010 Pat Patterson <pat at superpat dot com>
  * (C) 2003 Eklektix, Inc.
  *
