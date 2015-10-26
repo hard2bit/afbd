@@ -1,5 +1,5 @@
 /*
- * An antiforensics block device driver for Western Digital (Marvell) hard drives
+ * An antiforensics block device driver for Western Digital (Marvell & Marvell ROYL) hard drives
  *
  *	PCI SATA device address: 01.f5
  * 	I/O ports at b080 [size=8] <---
@@ -8,7 +8,9 @@
  *
  *	COMPILE:	make -C /lib/modules/`uname -r`/build M=`pwd` modules
  *        (In order for the compiler to compile this code, you'll need to download 
- *        the Linux headers package from your repository)
+ *        the Linux headers package from your repository. Valid for kernel versions
+ *        such that 2.6 < kv < 3.16, until someone handles the new kernel changes at
+ *        the block layer -regarding the struct request-.)
  *	USE:		insmod afbd.ko
  *	REMOVE:		rmmod afbd.ko
  *
@@ -64,7 +66,7 @@
 #include <linux/init.h>
 
 #include <linux/kernel.h> /* printk() */
-#include <linux/fs.h>     /* everything... */
+#include <linux/fs.h>     /* everything else */
 #include <linux/errno.h>  /* error codes */
 #include <linux/types.h>  /* size_t */
 #include <linux/vmalloc.h>
@@ -118,20 +120,23 @@ static char *Version = "0.1";
 static int major_num = 0;
 module_param(major_num, int, 0);
 
-static int logical_block_size = 512;
-module_param(logical_block_size, int, 0);
+static int phy_block_size = 512;        // For now we assume it's 512, as most of devices have 512 bytes currently.
+module_param(phy_block_size, int, 0);   // Bind the physical block size to the module.
 
 static unsigned char regs = 0;
 static unsigned int busy=0, drdy=0, df=0, dsc=0, drq=0, corr=0, idx=0, err=0, ready=0, drsc=0;    // Status register bits
-static unsigned int bbk=0, unc=0, mc=0, idnf=0, mcr=0, abrt=0, tk0nf=0, amnf=0;                // Error register bits
+static unsigned int bbk=0, unc=0, mc=0, idnf=0, mcr=0, abrt=0, tk0nf=0, amnf=0;                   // Error register bits
 static int p0=0, p1=0, p2=0, p3=0, p4=0, p5=0, p6=0, p7=0;                                        // I/O port address
 
 static int baseport = 0xb080;	// Obtained through lspci -v, lspci -D and ls -l /sys/bus/pci/devices/
 				// 0000\:00\:1f.5/host4/target4\:0\:0/4\:0\:0\:0/block/, for the PoC.
-static int sa_spt = 0;            // Sectors per track in SA zone
-static int sa_tracks = 0;        // Tracks per head corresponding to SA zone
-static int num_of_heads = 0;    // Number of heads in device
-static int nsectors = -1;        // Device size in sectors
+static int sa_spt = 0;          // Sectors per track in SA zone
+static int sa_cyl = 0;          // Tracks per head corresponding to SA zone
+static int vheads = 0;          // Number of heads in device
+static int aheads = 0;          // Number of available heads for the driver (vheads - 2)
+static int headmask = 0;        // Head map
+
+static int nsectors = -1;       // Device size in sectors
 
 module_param(nsectors, int, 0);
 
@@ -143,12 +148,23 @@ module_param(nsectors, int, 0);
  // PCHS block for translation
 static struct pchs {
     int c;
-    short h;
-    short s;
+    unsigned short h;
+    unsigned short s;
 };
+
+static struct logical_heads {
+    unsigned short h0;
+    unsigned short h1;
+    unsigned short h2;
+    unsigned short h3;
+    unsigned short h4;
+    unsigned short h5;
+    unsigned short h6;
+    unsigned short h7;
+} lheads;
  
-// Drive ID
-static struct ide_id {
+// Device ID
+static struct dev_id {
     short general_conf;
     short ob[9];
     char sn[20];
@@ -173,7 +189,7 @@ static struct ide_id {
     short apm;
     short mpr;
     short hwrs;
-    short ob5[6]; // +1
+    short ob5[6];
     int lba48sec;
     short ob6[13];
     short wps;
@@ -188,23 +204,6 @@ static struct ide_id {
     short in;
 };
 
-// Drive's zone table header
-static struct zone_header {
-    short u1;
-    short zones;
-    char u2[0x10];
-};
-
-// Drive's zone records
-static struct zone_rec {
-    int start_cyl;
-    int end_cyl;
-    int start_sec;
-    char pad[2];
-    int end_sec;
-    char pad2[2];
-};
-
 // Request queue
 static struct request_queue *Queue;
 
@@ -216,45 +215,56 @@ static struct afd_device {
     struct gendisk *gd;
 } Device;
 
+// For performance testing
+static struct timespec timest;
+
 
 /*********************************
  *       FUNCTION HEADERS        *
  *********************************/
  
-static void afd_transfer(struct afd_device *dev, sector_t sector,                // Handles an I/O transfer.
-    unsigned long nsect, char *buffer, int write);
-static void afd_request(struct request_queue *q);                                // Handles an I/O request.
-int afd_getgeo(struct block_device * block_device, struct hd_geometry * geo);    // Need to implement in order to use fdisk and the like.
+static void afd_transfer(struct afd_device* dev, sector_t sector,                // Handles an I/O transfer.
+    unsigned long nsect, char* buffer, int write);
+static void afd_request(struct request_queue* q);                                // Handles an I/O request.
+int afd_getgeo(struct block_device* block_device, struct hd_geometry* geo);      // Need to implement in order to use fdisk and the like.
 static int __init afd_init(void);                                                // Initialze drive parameters.
-static void __exit afd_exit(void);                                                // Free resources.
-static void read_regs();                                                        // Read drive's status register.
-static void status(int times);                                                    // Print drive status n times.
-static int waitready(int secs);                                                    // Wait for device setting readiness status.
-static int waitnobusy(int secs);                                                // Wait for device clearing busy status.
+static void __exit afd_exit(void);                                               // Free resources.
+static void read_regs(void);                                                     // Read drive's status register.
+static void status(int times);                                                   // Print drive status n times.
+static int waitready(int secs);                                                  // Wait for device setting readiness status.
+static int waitnobusy(int secs);                                                 // Wait for device clearing busy status.
 static int waitdrq(int secs);                                                    // Wait for device setting data request status.
-static int waitnodrq(int secs);                                                    // Wait for device clearing data request status.
-static int vsc_mode_on();                                                        // Prepare the device to accept vendor specific commands.
-static int vsc_mode_off();                                                        // End VSCE mode.
-static void write_buffer (char * sector);                                        // Write 512 bytes buffer (256w) to the device.
-static void read_buffer (char * sector);                                            // Read 512 bytes (256w) into char buffer.
-static int get_sa_spt(char * buf);                                                // Read Service Area's zone Sector Per Track integer.
-static int get_sa_tracks(char * buf, int size);                                    // Read Service Area's track count.
-static int get_dev_id(struct ide_id * d);                                        // Read ATA Device ID
-static int read_dev_pchs(char * buffer, short head, int track,                    // Read device physical sectors in CHS format into char buffer.
+static int waitnodrq(int secs);                                                  // Wait for device clearing data request status.
+
+static int vsc_mode_on(void);                                                    // Prepare the device to accept vendor specific commands.
+static int vsc_mode_off(void);                                                   // End VSCE mode.
+static void write_buffer (char* sector);                                         // Write 512 bytes buffer (256w) to the device.
+static void read_buffer (char* sector);                                          // Read 512 bytes (256w) into char buffer.
+
+static int get_saspt(char* cp5, int royl);                                       // Read Service Area's zone Sector Per Track integer.
+static int get_sacyl(char* cp1);                                                 // Read Service Area's track count.
+static int get_vheads(char* cp1);                                                // Get the number of installed & active heads.
+static int get_headmask(char* cp1);                                              // Get the active head binary mask.
+static int get_dev_family_code(char* model, char* family_code);                  // WD Marvell 2 or 3 digits family code.
+static int set_logical_heads(int headmask);                                      // Need a means for quickly translating logical heads to physical ones.
+static int is_compatible(char* family_code, int* royl);                          // Check for compatibility given family code. NOT IMPLEMENTED.
+
+static int get_dev_id(struct dev_id* d);                                         // Read ATA Device ID
+static int read_dev_pchs(char* buffer, short head, int track,                    // Read device physical sectors in CHS format into char buffer.
     short sector, short scount);
-static int write_dev_pchs(char * buffer, short head, int track,                    // Write char buffer into drive using physical CHS format.
+static int write_dev_pchs(char* buffer, short head, int track,                   // Write char buffer into drive using physical CHS format.
     short sector, short scount);
-static sector_t xlate_pchs(struct pchs chs);                                            // Translate a PCHS sector into LBA equivalent.
-static struct pchs xlate_pba(sector_t pba);                                            // Translate an LBA sector into its CHS coordinates.
-static int write_block(char * buffer, sector_t pba, unsigned long scount);        // Write data block to device.
-static int read_block(char * buffer, sector_t pba, unsigned long scount);        // Read block
-static int send_lba48_cmd(short command, short p1, short p2,                    // Send ATA command to the device.
+static sector_t xlate_pchs(struct pchs chs);                                     // Translate a PCHS sector into LBA equivalent.
+static struct pchs xlate_pba(sector_t pba);                                      // Translate an LBA sector into its CHS coordinates.
+static int write_block(char* buffer, sector_t pba, unsigned long scount);        // Write data block to device.
+static int read_block(char* buffer, sector_t pba, unsigned long scount);         // Read block
+static int send_longvsc_cmd(short command, short p1, short p2,                   // Send ATA command to the device.
     short p3, short p4, short p5, short p6);
-static int dev_rw_buffer_cmd(unsigned char length);                                // Set buffer length to operate with through the ATA port.
-static int dev_send_cmd(short command, short para1, short para2);                // Send command
-static int dev_get_cp(short cp, char ** out_buff, int * len);                    // Read device configuration page
-static void flip (char * buf, int len);                                            // Flip every two bytes in the chain.
-static void usleep(int millis);													// We need our own implementation of usleep. Single writing operations to port 0x80 should take about 1 ms.
+static int dev_pre_xfer_cmd(unsigned char length);                               // Set buffer length to operate with through the ATA port.
+static int send_vsc_cmd(short command, short para1, short para2);                // Send command
+static int dev_get_cp(short cp, char** out_buff, int * len);                     // Read device configuration page
+static void flip (char* buf, int len);                                           // Flip every two bytes in the chain.
+static void usleep(int millis);	                                                 // We need our own implementation of usleep. Single writing operations to port 0x80 should take about 1 ms.
 static void print_status(char * msg);
 
 /*********************************
@@ -266,8 +276,8 @@ static void print_status(char * msg);
  */
 static void afd_transfer(struct afd_device *dev, sector_t sector,
         unsigned long nsect, char *buffer, int write) {
-    unsigned long offset = sector * logical_block_size;
-    unsigned long nbytes = nsect * logical_block_size;
+    unsigned long offset = sector * phy_block_size;
+    unsigned long nbytes = nsect * phy_block_size;
 
     if ((offset + nbytes) > dev->size) {
         printk (KERN_NOTICE "afd: Beyond-end write (%ld %ld)\n", offset, nbytes);
@@ -305,9 +315,9 @@ static void afd_request(struct request_queue * q) {
  */
 int afd_getgeo(struct block_device * block_device, struct hd_geometry * geo) {
     long size;
-    size = Device.size * (logical_block_size / KERNEL_SECTOR_SIZE);
-    geo->cylinders = sa_tracks - 1;
-    geo->heads = num_of_heads;
+    size = Device.size * (phy_block_size / KERNEL_SECTOR_SIZE);
+    geo->cylinders = sa_cyl - 1;
+    geo->heads = vheads;
     geo->sectors = sa_spt;
     geo->start = 0;
     return 0;
@@ -320,7 +330,6 @@ static struct block_device_operations afd_ops = {
 
 static int __init afd_init(void) {
 
-   
     p0 = baseport;   
 
     p1 = p0+1;
@@ -331,26 +340,71 @@ static int __init afd_init(void) {
     p6 = p5+1;
     p7 = p6+1;
 
-    struct ide_id id;
-    get_dev_id(&id);
     char model[64];
+    char family_code[4];
+    int royl;
+    struct dev_id id;
+    char* cp_buff;
+    int cp_len;
+    int unused_sectors;
+    int unused_bytes;
+    int error = 0;
+
+    get_dev_id(&id);
+    memset(family_code, 0, 4);
     memset(model, 0, 64);
     memcpy(model, id.model, 40);
     flip(model, 40);
     printk (KERN_NOTICE "afd: Detected device: %s\n", model);
     memcpy(Device.model, model, 40);
-   
-    char * out_buff;
-    int len;
-    if (dev_get_cp(0x05, &out_buff, &len) == 0) {
-        sa_spt = get_sa_spt(out_buff);
-        sa_tracks = get_sa_tracks(out_buff, len * logical_block_size);
-        num_of_heads = 4;    // constant for now.
 
-        printk (KERN_NOTICE "afd: SA SPT: (%d); SA tracks: (%d); Usable heads: (%d); Unused reversed space: %d sectors [%d bytes]\n", sa_spt, sa_tracks, num_of_heads, sa_tracks * sa_spt * (num_of_heads), sa_tracks * sa_spt * (num_of_heads) * logical_block_size);
+    get_dev_family_code(model, family_code);
+    if (!is_compatible(family_code, &royl)) {
+        printk (KERN_NOTICE "afd: Device is family %s is not compatible. Exiting.\n", family_code);
+        goto out;
     }
-    nsectors = (sa_tracks - 1) * sa_spt * (num_of_heads);    // Device reserved area usable space in sectors
-    Device.size = nsectors * logical_block_size;        // Device reserved area usable space in bytes
+
+    printk (KERN_NOTICE "afd: Family code detected: %s.\n", family_code);
+
+    if (dev_get_cp(0x01, &cp_buff, &cp_len) == 0) {
+        sa_cyl = get_sacyl(cp_buff);
+        vheads = get_vheads(cp_buff);
+        aheads = vheads - 2;
+        headmask = get_headmask(cp_buff);
+        set_logical_heads(headmask);
+        printk (KERN_NOTICE "afd: Installed heads: %d.\n", vheads);
+    } else {
+        printk (KERN_NOTICE "afd: Error reading configuration page 0x01. Exiting.\n");
+        goto out;
+    }
+    vfree(*&cp_buff);
+
+    if (dev_get_cp(0x05, &cp_buff, &cp_len) == 0) {
+        sa_spt = get_saspt(cp_buff, royl);
+        printk (KERN_NOTICE "afd: SA SPT detected: %d.\n", sa_spt);
+    } else {
+        printk (KERN_NOTICE "afd: Error reading configuration page 0x05. Exiting.\n");
+        goto out;
+    }
+    vfree(*&cp_buff);
+
+    if (error) {
+        printk (KERN_NOTICE "afd: Error reading configuration pages. Exiting.\n");
+        goto out;
+    }
+
+    unused_sectors = sa_cyl * sa_spt * aheads;
+    unused_bytes = sa_cyl * sa_spt * aheads * phy_block_size;
+
+    printk(KERN_NOTICE "afd: SPT=%d, usable heads=%d, hmap=%02xh, avail. cylinders=%d, log-to-phy hmap=[%hd,%hd,%hd,%hd,%hd,%hd,%hd,%hd], usable sectors=%d [%d bytes]\n", sa_spt, aheads, headmask, sa_cyl, lheads.h0, lheads.h1, lheads.h2, lheads.h3, lheads.h4, lheads.h5, lheads.h6, lheads.h7, unused_sectors, unused_bytes);
+
+    if (aheads <= 0) {
+        printk(KERN_WARNING "afd: HDD has not enough heads in order to continue. Aborting.\n");
+        goto out;
+    }
+
+    nsectors = (sa_cyl - 1) * sa_spt * (aheads);      // Device reserved area usable space in sectors. We'll skip cylinder -1 here.
+    Device.size = nsectors * phy_block_size;           // Device reserved area usable space in bytes
    
     spin_lock_init(&Device.lock);
     /*
@@ -359,7 +413,7 @@ static int __init afd_init(void) {
     Queue = blk_init_queue(afd_request, &Device.lock);
     if (Queue == NULL)
         goto out;
-    blk_queue_logical_block_size(Queue, logical_block_size);
+    blk_queue_logical_block_size(Queue, phy_block_size);
     /*
      * Get registered.
      */
@@ -400,17 +454,42 @@ static void __exit afd_exit(void) {
 
 /** Unused */
 static sector_t xlate_pchs(struct pchs chs) {
-    sector_t pba = ((chs.c * num_of_heads) + chs.h) * sa_spt + chs.s + 1;
+    sector_t pba = ((chs.c * aheads) + chs.h) * sa_spt + chs.s + 1;
     return pba;
 }
 
 static struct pchs xlate_pba(sector_t _pba) {
     struct pchs chs;
     int pba = (int)(_pba);
-    chs.c = -1 - (pba / (sa_spt * num_of_heads));
-    chs.h = (short)((((pba / sa_spt) % num_of_heads) + 2));
-    chs.s = (short)(((pba % sa_spt) + 1));
-    //printk(KERN_NOTICE "afd: PBA=%d, CHS=%d,%d,%d.\n", pba, chs.c, chs.h, chs.s);
+    int phy_h = (pba / sa_spt) % aheads;
+    chs.c = -sa_cyl + ((pba / (sa_spt * aheads)));
+
+    switch (phy_h) {
+        case 0:
+            chs.h = lheads.h0;
+            break;
+        case 1:
+            chs.h = lheads.h1;
+            break;
+        case 2:
+            chs.h = lheads.h2;
+            break;
+        case 3:
+            chs.h = lheads.h3;
+            break;
+        case 4:
+            chs.h = lheads.h4;
+            break;
+        case 5:
+            chs.h = lheads.h5;
+            break;
+        case 6:
+            chs.h = lheads.h6;
+            break;
+    }
+
+    chs.s = (short)((pba % sa_spt) + 1);
+    printk(KERN_NOTICE "afd: XLATE PBA=%d --> CHS=%d,%hd,%hd.\n", pba, chs.c, chs.h, chs.s);
     return chs;
 }
 
@@ -419,7 +498,7 @@ static struct pchs xlate_pba(sector_t _pba) {
  ****************************************************/
 static int read_block(char * buffer, sector_t pba, unsigned long scount) {
     char * sector;
-    sector = vmalloc(logical_block_size);
+    sector = vmalloc(phy_block_size);
     struct pchs _chs;
     int sc = 0;
     unsigned int buff_position = 0;
@@ -429,14 +508,14 @@ static int read_block(char * buffer, sector_t pba, unsigned long scount) {
 	short _head = _chs.h;
 	short _sector = _chs.s;
         if (0 == read_dev_pchs(sector, _head, _cylinder, _sector, 1)) {
-	    //printk(KERN_WARNING "afd: read_block OK at sector %d (block %d), CHS=%d,%d,%d.\n", pba, sc, _cylinder, _head, _sector);
+	    //printk(KERN_WARNING "afd: read_block OK at sector %d (block %d), CHS=%d,%hd,%hd.\n", pba, sc, _cylinder, _head, _sector);
 	} else {
-            printk(KERN_WARNING "afd: read_block FAILED at sector %d (block %d), CHS=%d,%d,%d.\n", pba, sc, _cylinder, _head, _sector);
+            printk(KERN_WARNING "afd: read_block FAILED at sector %d (block %d), CHS=%d,%hd,%hd.\n", pba, sc, _cylinder, _head, _sector);
             vfree(sector);
             return 1;
         }
-        memcpy(buffer + buff_position, sector, logical_block_size);
-        buff_position += logical_block_size;
+        memcpy(buffer + buff_position, sector, phy_block_size);
+        buff_position += phy_block_size;
     }
     vfree(sector);
     return 0;
@@ -451,18 +530,16 @@ static int read_dev_pchs (char * buffer, short head, int track, short sector, sh
     int sectorsread = 0;
     long int sectorslow;
     long int sectorshigh;
-    char a[logical_block_size];
+    char a[phy_block_size];
     int len = 0;
     int rc = 0;
 
-    //read_regs();
-    //printk(KERN_WARNING "afd: read_dev_pchs - about to read: C=%d, H=%d, S=%d, count=%d.\n", track, head, sector, scount);
-    //print_status("Before selecting master");
-
     outb(0xa0, p6);    // Select master
 
+    getnstimeofday(&timest);
+    //printk(KERN_WARNING "afd: starting READ at %d.%lu\n", timest.tv_sec, timest.tv_nsec);
+
     read_regs();
-    print_status("After selecting master");
 
     if (waitready(3)) {
         printk(KERN_WARNING "afd: read_dev_pchs - Drive not ready, aborting.\n");
@@ -474,9 +551,9 @@ static int read_dev_pchs (char * buffer, short head, int track, short sector, sh
         return (1);
     }
 
-    rc = send_lba48_cmd(0x000c, 0x0001, (track & 0xffff), (track >> 16) & 0xffff, head, sector, scount);
+    rc = send_longvsc_cmd(0x000c, 0x0001, (track & 0xffff), (track >> 16) & 0xffff, head, sector, scount);
     if (rc) {
-        printk(KERN_WARNING "afd: read_dev_pchs - send ATA command fail, aborting.\n");
+        printk(KERN_WARNING "afd: read_dev_pchs - send VSC fail, aborting.\n");
         return(1);
     }
 
@@ -490,24 +567,24 @@ static int read_dev_pchs (char * buffer, short head, int track, short sector, sh
     len = sectorslow + (sectorshigh << 8);
 
     if (len < 1) {
-        printk(KERN_WARNING "afd: read_dev_pchs - Length less than 1, aborting.\n");
+        printk(KERN_WARNING "afd: read_dev_pchs - Nothing to read, aborting.\n");
         return(1);
     }
 
     sectorsread = 0;
 
     while (len > sectorsread) {
-        rc = dev_rw_buffer_cmd(1);
+        rc = dev_pre_xfer_cmd(1);
         if (rc) {
-            printk(KERN_WARNING "afd: read_dev_pchs - dev_rw_buffer_cmd failed, aborting.\n");
+            printk(KERN_WARNING "afd: read_dev_pchs - Data transfer preparation failed, aborting.\n");
             return(1);
         }
 
         read_regs();
         while (drq) {
-            memset(a, 0, logical_block_size);
+            memset(a, 0, phy_block_size);
             read_buffer(a);
-            memcpy(buffer + (sectorsread * logical_block_size), a, logical_block_size);
+            memcpy(buffer + (sectorsread * phy_block_size), a, phy_block_size);
             sectorsread++;
             rc = waitready(60);
            
@@ -526,6 +603,9 @@ static int read_dev_pchs (char * buffer, short head, int track, short sector, sh
         return(1);
     }
 
+    getnstimeofday(&timest);
+    //printk(KERN_WARNING "afd: finishing READ at %d.%lu\n", timest.tv_sec, timest.tv_nsec);
+
     return(0);
 }
 
@@ -534,11 +614,11 @@ static int read_dev_pchs (char * buffer, short head, int track, short sector, sh
  ****************************************************/
 static int write_block(char * buffer, sector_t pba, unsigned long scount) {
     char * sector;
-    sector = vmalloc(logical_block_size);
+    sector = vmalloc(phy_block_size);
     struct pchs chs;
     int sc = 0;
     for (sc=0; sc<scount; sc++) {
-        memcpy(sector, buffer, logical_block_size);
+        memcpy(sector, buffer, phy_block_size);
         chs = xlate_pba(pba);
         if (0 == write_dev_pchs(sector, chs.h, chs.c, chs.s, 1));
         else {
@@ -557,11 +637,14 @@ static int write_dev_pchs (char * buffer, short head, int track, short sector, s
     int sectorswritten = 0;
     long int sectorslow;
     long int sectorshigh;
-    char a[logical_block_size];
+    char a[phy_block_size];
     int len;
     int rc;
 
     outb(0xa0, p6);
+
+    getnstimeofday(&timest);
+    printk(KERN_WARNING "afd: starting WRITE at %d.%lu\n", timest.tv_sec, timest.tv_nsec);
 
     if (waitready(3)) {
         printk(KERN_WARNING "afd: write_dev_pchs - drive not ready, aborting.\n");
@@ -571,11 +654,9 @@ static int write_dev_pchs (char * buffer, short head, int track, short sector, s
     if (vsc_mode_on()) {   
         printk(KERN_WARNING "afd: write_dev_pchs - cannot enter VSC mode, aborting.\n");
         return (1);
-    } else {
-        //printk(KERN_NOTICE "afd: write_dev_pchs - VSC mode ON.\n");
     }
 
-    rc = send_lba48_cmd(0x000c, 0x0002, (track & 0xffff), (track >> 16) & 0xffff, head, sector, scount);
+    rc = send_longvsc_cmd(0x000c, 0x0002, (track & 0xffff), (track >> 16) & 0xffff, head, sector, scount);
     if (rc != 0) {
         printk(KERN_WARNING "afd: write_dev_pchs - send ATA command fail, aborting.\n");
         return(1);
@@ -595,8 +676,8 @@ static int write_dev_pchs (char * buffer, short head, int track, short sector, s
     sectorswritten = 0;
 
     while (len > sectorswritten) {
-        if (dev_rw_buffer_cmd(1)) {
-            printk(KERN_WARNING "afd: write_dev_pchs - write buffer command failed, aborting.\n");
+        if (dev_pre_xfer_cmd(1)) {
+            printk(KERN_WARNING "afd: write_dev_pchs - write prepare command failed, aborting.\n");
             return(1);
         }
         read_regs();
@@ -626,18 +707,18 @@ static int write_dev_pchs (char * buffer, short head, int track, short sector, s
         return(1);
     }
 
+    getnstimeofday(&timest);
+    printk(KERN_WARNING "afd: finishing WRITE at %d.%lu\n", timest.tv_sec, timest.tv_nsec);
+
     return(0);
 }
 
-static int send_lba48_cmd(short command, short par1, short par2, short par3, short par4, short par5, short par6)
+static int send_longvsc_cmd(short command, short par1, short par2, short par3, short par4, short par5, short par6)
 {
-    char a[logical_block_size];
+    char a[phy_block_size];
     int rc;
 
-    //read_regs();
-    //print_status("About to send full command");
-
-    memset(a, 0, logical_block_size);
+    memset(a, 0, phy_block_size);
 
     a[1]=(command>>8) & 0xff ;
     a[0]=(command & 0x00ff);
@@ -663,10 +744,9 @@ static int send_lba48_cmd(short command, short par1, short par2, short par3, sho
 
     outb(0xa0, p6);
     read_regs();
-    //print_status("Intention to send command notified.");
 
     if (busy) {
-        printk(KERN_WARNING "afd: send_lba48_cmd - drive is BSY, aborting.\n");
+        printk(KERN_WARNING "afd: send_longvsc_cmd - drive is BSY, aborting.\n");
         return 1;
     }
 
@@ -679,17 +759,16 @@ static int send_lba48_cmd(short command, short par1, short par2, short par3, sho
     outb(0xb0,p7);	//SMART command
 
     read_regs();
-    //print_status("Command sent.");
 
     rc = waitnobusy(60);
     if (rc) {
-        printk(KERN_WARNING "afd: send_lba48_cmd - drive is BSY [waitnobusy(60)], aborting.\n");
+        printk(KERN_WARNING "afd: send_longvsc_cmd - drive is BSY [waitnobusy(60)], aborting.\n");
         return(1);
     }
    
     read_regs();
     if (!drq) {
-        printk(KERN_WARNING "afd: send_lba48_cmd - DRQ: (%d), aborting.\n", drq);
+        printk(KERN_WARNING "afd: send_longvsc_cmd - DRQ: (%d), aborting.\n", drq);
         return(1);
     }
 
@@ -697,14 +776,13 @@ static int send_lba48_cmd(short command, short par1, short par2, short par3, sho
 
     rc = waitnobusy(5);
     if (rc) {
-        printk(KERN_WARNING "afd: send_lba48_cmd - drive is BSY [waitnobusy(5)=%d], aborting.\n", rc);
+        printk(KERN_WARNING "afd: send_longvsc_cmd - drive is BSY [waitnobusy(5)=%d], aborting.\n", rc);
         return(1);
     }
 
     read_regs();
-    //print_status("Finished sending command...");
     if (err) {           
-        printk(KERN_WARNING "afd: send_lba48_cmd - Error register was set while sending the command.\n");
+        printk(KERN_WARNING "afd: send_longvsc_cmd - Error register was set while sending the command.\n");
         return(1);
     }
 
@@ -712,15 +790,15 @@ static int send_lba48_cmd(short command, short par1, short par2, short par3, sho
 }
 
 /*
- *    Read ATA registers.
+ *    Read ATA STATUS register.
  */
-static void read_regs() {
+static void read_regs(void) {
     unsigned char s;
     s = inb(p7);
     regs = s;
    
     busy = ATA_SR_BSY == (s & ATA_SR_BSY);
-    drdy = ATA_SR_DRDY == (s & ATA_SR_DRDY);        //drive ready
+    drdy = ATA_SR_DRDY == (s & ATA_SR_DRDY);         //drive ready
     df = ATA_SR_DF == (s & ATA_SR_DF);
     dsc = ATA_SR_DSC == (s & ATA_SR_DSC);            // drive seek complete
     drq = ATA_SR_DRQ == (s & ATA_SR_DRQ);
@@ -732,15 +810,15 @@ static void read_regs() {
 }
 
 /*
- *    RW buffer ATA command
+ *    READ SMART LOG Command - prepare for data transfer (R/W)
  */
-static int dev_rw_buffer_cmd(unsigned char length) {
+static int dev_pre_xfer_cmd(unsigned char length) {
     int rc = 0;
     outb(0xa0, p6);    // Select master
 
     rc = waitnobusy(3);
     if (rc)    {   
-        printk(KERN_WARNING "afd: dev_rw_buffer_cmd - drive is BSY, aborting.\n");
+        printk(KERN_WARNING "afd: dev_pre_xfer_cmd - drive is BSY, aborting.\n");
         return 1;
     }
    
@@ -754,12 +832,12 @@ static int dev_rw_buffer_cmd(unsigned char length) {
 
     rc = waitnobusy(60);
     if (rc) {
-        printk(KERN_WARNING "afd: dev_rw_buffer_cmd - drive is BSY after I/O waiting, aborting.\n");
+        printk(KERN_WARNING "afd: dev_pre_xfer_cmd - drive is BSY after I/O waiting, aborting.\n");
         return(1);
     }
 
     if (0 != waitdrq(3)) {
-        printk(KERN_WARNING "afd: dev_rw_buffer_cmd - drive didn't set the DRQ flag, aborting.\n");
+        printk(KERN_WARNING "afd: dev_pre_xfer_cmd - drive didn't set the DRQ flag, aborting.\n");
         return(1);
     }
 
@@ -770,15 +848,12 @@ static int dev_rw_buffer_cmd(unsigned char length) {
  * Get drive's configuration page
  */
 static int dev_get_cp(short cp, char ** out_buff, int * len) {
-    char buff[logical_block_size];
+    char buff[phy_block_size];
     char * new_buff;
     unsigned char i;
     int rc = 0;
 
     read_regs();
-    printk(KERN_WARNING "afd: dev_get_cp - STATUS BEFORE: BSY=%d DRD=%d DSC=%d.\n", busy, drdy, dsc);
-
-    // choose primary port
     outb(0xa0, p6);
 
     read_regs();
@@ -792,9 +867,9 @@ static int dev_get_cp(short cp, char ** out_buff, int * len) {
         return(1);
     }
 
-    rc = dev_send_cmd(0x000d, cp, 0x0000);
+    rc = send_vsc_cmd(0x000d, cp, 0x0000);
     if (rc) {
-        printk(KERN_WARNING "afd: dev_get_cp - dev_send_cmd failed, aborting.\n");
+        printk(KERN_WARNING "afd: dev_get_cp - send_vsc_cmd failed, aborting.\n");
         return(1);
     }
 
@@ -804,31 +879,42 @@ static int dev_get_cp(short cp, char ** out_buff, int * len) {
         return(1);
     }   
 
-    (* len) = inb(p4);    // Read length
+    (* len) = inb(p4);                             // Read length
+    new_buff = vmalloc((*len) * phy_block_size);   // Allocate for reading page
 
-    new_buff = vmalloc((*len) * logical_block_size);
-
-    rc = dev_rw_buffer_cmd((*len));
+    rc = dev_pre_xfer_cmd((*len));
     if (rc) {
-        printk(KERN_WARNING "afd: dev_get_cp - dev_rw_buffer_cmd failed, aborting.\n");
+        printk(KERN_WARNING "afd: dev_get_cp - dev_pre_xfer_cmd failed, aborting.\n");
         return(1);
     }
 
     for (i=0; i<(*len); i++) {
         if (0 == waitdrq(3)) {
             read_buffer(buff);
-            memcpy(new_buff + (i * logical_block_size), buff, logical_block_size);
+            memcpy(new_buff + (i * phy_block_size), buff, phy_block_size);
             waitnobusy(3);
         }
     }
     (*out_buff) = new_buff;
+
+        printk (KERN_NOTICE "afd: CP Length: %d, CP 0x%hd: \n", *len, cp);
+        int c;
+        for (c=0; c < *len*512; c++) {
+            unsigned char l = new_buff[c];
+            printk ("0x%02x ", l);
+            if ((c % 16) == 15) {
+                printk ("\n");
+            }
+        }
+        printk ("\n");
+
     return(0);
 }
 
 /*
  * VSC mode ON
  */
-static int vsc_mode_on() {
+static int vsc_mode_on(void) {
     int rc;
     outb(0xa0, p6);    // Select master
 
@@ -864,7 +950,7 @@ static int vsc_mode_on() {
 /*
  * VSC mode OFF
  */
-static int vsc_mode_off() {
+static int vsc_mode_off(void) {
     int rc;
     outb(0xa0, p6);    // Select master
 
@@ -896,21 +982,31 @@ static int vsc_mode_off() {
     return(0);
 }
 
-int dev_send_cmd(short command, short par1, short par2) {
+int send_vsc_cmd(short command, short par1, short par2) {
 
     char a[512];
     int rc;
 
     memset(a, 0, 512);
 
-    a[1] = (command>>8) & 0xff ;
-    a[0] = (command & 0x00ff);
+    a[1] = (char)(command>>8) & 0xff ;
+    a[0] = (char)(command & 0xff);
 
-    a[3] = (par1>>8) & 0xff;
-    a[2] = (par1 & 0x00ff);
+    a[3] = (char)(par1>>8) & 0xff;
+    a[2] = (char)(par1 & 0xff);
 
-    a[5] = (par2>>8) & 0xff;
-    a[4] = (par2 & 0x00ff);
+    a[5] = (char)(par2>>8) & 0xff;
+    a[4] = (char)(par2 & 0xff);
+
+    printk(KERN_WARNING "afd: VSC=");
+    int c;
+    for (c=0; c < 8; c++) {
+        unsigned char l = a[c];
+        printk ("0x%02x ", l);
+        if ((c % 16) == 15) {
+            printk ("\n");
+        }
+    }
 
     // select master
     outb(0xa0, p6);
@@ -962,27 +1058,88 @@ int dev_send_cmd(short command, short par1, short par2) {
 /*
  * Service Area
  */
-static int get_sa_spt(char * buff) {
-    int pos = 0;
-    short spt;
+static int get_saspt(char * cp5, int royl) {
+    int offset = 0;
+    short spt = 0;
 
-    pos += sizeof(struct zone_header);
-    pos += sizeof(struct zone_rec);
+    if (royl) {
+        offset = 0x6c;
+    } else {
+        offset = 0x28;
+    }
 
-    memcpy(&spt, buff + pos, 2);
+    memcpy(&spt, cp5 + offset, 2);
 
     return(spt);
 }
 
 
-static int get_sa_tracks(char * buff, int size) {
-    struct zone_rec rec1;
-    if ( (sizeof(struct zone_header) + sizeof(struct zone_rec)) < size ) {
-        memcpy(&rec1, buff + sizeof(struct zone_header), sizeof(struct zone_rec));
-        return(abs(rec1.start_cyl));
-    } else {
-        return(0);
+static int get_sacyl(char * cp1) {
+    int offset = 0x24;
+    short cyl = 0;
+
+    memcpy(&cyl, cp1 + offset, 2);
+
+    return(cyl);
+}
+
+static int get_vheads(char* cp1) {
+    int offset = 0x1E;
+    short vh = 0;
+
+    memcpy(&vh, cp1 + offset, 1);
+
+    return(vh);
+}
+
+static int get_headmask(char* cp1) {
+    int offset = 0x1F;
+    short hm = 0;
+
+    memcpy(&hm, cp1 + offset, 1);
+
+    return(hm);
+}
+
+static int set_logical_heads(int headmask) {
+    int curr, skipped, i;
+    int* _lheads_x;
+    curr = 0;
+    skipped = 0;
+    for (i=0; i<8; i++) {
+        int h = 1 << i;
+        if (headmask & h) {
+            if (skipped++ >= 2) {
+                switch (curr) {
+                    case 0:
+                        lheads.h0 = i;
+                        break;
+                    case 1:
+                        lheads.h1 = i;
+                        break;
+                    case 2:
+                        lheads.h2 = i;
+                        break;
+                    case 3:
+                        lheads.h3 = i;
+                        break;
+                    case 4:
+                        lheads.h4 = i;
+                        break;
+                    case 5:
+                        lheads.h5 = i;
+                        break;
+                    case 6:
+                        lheads.h6 = i;
+                        break;
+                    default:
+                        break;
+                }
+                curr += 1;
+            }
+        }
     }
+    return 0;
 }
 
 /*
@@ -1065,7 +1222,7 @@ int waitnobusy(int secs) {
 /*
  * Drive ID
  */
-static int get_dev_id (struct ide_id *d) {
+static int get_dev_id (struct dev_id *d) {
 
     read_regs();
     printk(KERN_WARNING "afd: get_drive_id - STATUS BEFORE: BSY=%d DRD=%d DSC=%d.\n", busy, drdy, dsc);
@@ -1082,26 +1239,58 @@ static int get_dev_id (struct ide_id *d) {
     memset(buff, 0, 512);
     read_buffer (buff);
 
-    memcpy(d, buff, sizeof(struct ide_id));
+    memcpy(d, buff, sizeof(struct dev_id));
 
     return(0);   
+}
+
+/* Get the family code. Returns the size of the code, or 0 if not found */
+static int get_dev_family_code(char* model, char* family_code) {
+    char* hyphen;
+    char* end;
+    hyphen = strchr(model, '-');
+    if (hyphen != NULL) {
+        end = strchr(hyphen, ' ');
+        if (end != NULL) {
+		size_t fullfam_len = end - hyphen;
+            	if (fullfam_len == 7) {
+		   memcpy(family_code, hyphen+3, 2);
+		   return 2;
+		} else if (fullfam_len == 8) {
+		   memcpy(family_code, hyphen+3, 3);
+		   return 3;
+		} else {
+		    printk(KERN_WARNING "afd: Family unknown. Length = %d.\n", fullfam_len);
+		}
+        }
+    }
+    return 0;
+}
+
+/*****************************************
+ * Return 1 if compatible                *
+ * NOT IMPLEMENTED !!!                   *
+ *                                       */
+static int is_compatible(char* family_code, int* royl) {
+    *royl = 0; //Manually set to NOT ROYL. Change for other models until implemented.
+    return 1;
 }
 
 /*
  * Write buffer to I/O port
  */
-static void write_buffer (char * sector) {
+static void write_buffer (char* sector) {
     outsw(p0, sector, 256);
 }
 
 /*
  * Read buffer from I/O port
  */
-static void read_buffer (char * sector) {
+static void read_buffer (char* sector) {
     insw(p0, sector, 256);
 }
 
-void flip (char * buf, int len) {
+void flip (char* buf, int len) {
     int i=0;
     for (i=0; i<len-1; i+=2) {
         char k;
@@ -1112,7 +1301,7 @@ void flip (char * buf, int len) {
 }
 
 static void print_status(char * msg) {
-	//printk(KERN_NOTICE "afd: %s - DRIVE STATUS: BSY=%d DRD=%d DSC=%d ERR=%d INF=%d.\n", msg, busy, drdy, dsc, err, idnf);
+    printk(KERN_NOTICE "afd: %s - DRIVE STATUS: BSY=%d DRD=%d DSC=%d ERR=%d INF=%d.\n", msg, busy, drdy, dsc, err, idnf);
 }
 
 static void usleep (int millis) {
